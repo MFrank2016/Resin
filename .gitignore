@@ -9,3 +9,8 @@ start-instance.sh
 .claude/
 .omc/
 .local/
+.omo/
+
+# 本地部署与运行数据（docker-compose.yml 由 .example 复制而来）
+data/
+docker-compose.yml

@@ -1,6 +1,8 @@
 package topology
 
 import (
+	"context"
+	"errors"
 	"time"
 
 	"github.com/Resinat/Resin/internal/model"
@@ -15,9 +17,44 @@ func (p *GlobalNodePool) ApplyFeedback(hash node.Hash, version uint64, f node.Fe
 	if version == 0 {
 		return false
 	}
-	return p.applyFeedback(hash, version, f)
+	if errors.Is(f.Err, context.Canceled) {
+		f.Result = nil
+	}
+	var relay *node.RelayError
+	failedViaRelay := f.Result != nil && !*f.Result &&
+		errors.As(f.Err, &relay)
+	if failedViaRelay && relay.ServerDial {
+		// Keep the landing's probe attempt/error, but not a failure sample.
+		f.Result = nil
+	}
+	applied := p.applyFeedback(hash, version, f)
+	if !applied {
+		return applied
+	}
+	if f.Result != nil && *f.Result && !f.Relay.Hash.IsZero() && f.Relay.Version != 0 {
+		p.ApplyFeedback(f.Relay.Hash, f.Relay.Version, node.Feedback{Result: f.Result, PlatformID: f.PlatformID})
+	}
+	if !failedViaRelay {
+		return applied
+	}
+	if relay.ServerDial {
+		failed, message := false, relay.Error()
+		p.ApplyFeedback(relay.Hash, relay.Version, node.Feedback{
+			Result: &failed, LastError: &message, PlatformID: f.PlatformID,
+		})
+	} else if p.onRelaySuspect != nil {
+		if entry, ok := p.GetEntry(relay.Hash); ok && entry.RoutingVersion() == relay.Version && entry.RoutingRole() == node.RoleRelay {
+			p.onRelaySuspect(relay.Hash)
+		}
+	}
+	return applied
 }
 func (p *GlobalNodePool) applyFeedback(hash node.Hash, version uint64, f node.Feedback) bool {
+	failed := (f.Result != nil && !*f.Result || f.Err != nil) && !errors.Is(f.Err, context.Canceled)
+	binding := node.BindingFromError(f.Err)
+	if binding == nil {
+		binding = f.Relay.Binding
+	}
 	if f.Result != nil && !*f.Result && p.passiveCircuitBreakerDisabled(f.PlatformID) {
 		f.Result = nil
 	}
@@ -29,6 +66,7 @@ func (p *GlobalNodePool) applyFeedback(hash node.Hash, version uint64, f node.Fe
 		decay = p.latencyDecayWindow()
 	}
 	applied, dynamic, dirty := false, false, false
+	revokeBinding := false
 	var domains []string
 	p.nodes.Compute(hash, func(e *node.NodeEntry, loaded bool) (*node.NodeEntry, xsync.ComputeOp) {
 		if !loaded || (version != 0 && e.RoutingVersion() != version) {
@@ -44,7 +82,9 @@ func (p *GlobalNodePool) applyFeedback(hash node.Hash, version uint64, f node.Fe
 				count := e.FailureCount.Add(1)
 				dynamic = true
 				if threshold > 0 && int(count) >= threshold {
-					e.CircuitOpenSince.CompareAndSwap(0, time.Now().UnixNano())
+					if e.CircuitOpenSince.CompareAndSwap(0, time.Now().UnixNano()) {
+						e.CircuitGeneration.Add(1)
+					}
 				}
 			}
 			dirty = before != e.IsCircuitOpen()
@@ -84,8 +124,12 @@ func (p *GlobalNodePool) applyFeedback(hash node.Hash, version uint64, f node.Fe
 		if f.LastError != nil {
 			e.SetLastError(*f.LastError)
 		}
+		revokeBinding = failed && binding != nil && e.IsCircuitOpen()
 		return e, xsync.CancelOp
 	})
+	if revokeBinding {
+		binding.Invalidate()
+	}
 	if dirty {
 		p.notifyAllPlatformsDirty(hash)
 	}
